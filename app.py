@@ -82,47 +82,109 @@ def normalize_name(name):
     ).strip()
     return cleaned.lower()
 
-def extract_shifts(text, target_names, year, closing_hours):
+def extract_shifts(text, year, closing_hours):
     """
-    Gennemgå tekstlinjer og udtræk events for skift, der matcher navnene i target_names.
+    Gennemgå tekstlinjer og udtræk events for skift for alle navne i planen.
+
+    - Overskrifter kan være:
+      • "Moments – Navn: DD/MM" eller "Moments: DD/MM"    → location="Moments"
+      • "Albert Rex: DD/MM"                                → location="Albert Rex"
+      • "<Personnavn>: DD/MM"                              → location="Moments"
+      • "Mandag d.4/4" (ugedags‐header)                     → location="D'Wine Bar, Algade 54, 9000 Aalborg"
+      • Ingen præfiks‐header i forlængelse af en dato       → location="D'Wine Bar, Algade 54, 9000 Aalborg"
+
+    - Kun “Albert Rex” anvendes som særskilt lokation.
+      Alle person‐headers (to-ords-præfikser) bliver til "Moments".
+      Hvis der ikke er nogen præfiks‐header (f.eks. efter “Mandag d.4/4”), bruges D'Wine Bar.
     """
-    pattern_date1 = re.compile(r"\b\w+\.?\s*d\.?\s*(\d{1,2})/(\d{1,2})", re.IGNORECASE)
-    pattern_date2 = re.compile(r"^(.+?):\s*(\d{1,2})/(\d{1,2})", re.IGNORECASE)
+    # 1) Matcher "Prefix – Person: DD/MM"
+    pattern_date_ext = re.compile(
+        r"^(.+?)\s*[\-–]\s*.+?:\s*(\d{1,2})/(\d{1,2})\s*$",
+        re.IGNORECASE,
+    )
+    # 2) Matcher "Prefix: DD/MM"
+    pattern_date_simple = re.compile(
+        r"^(.+?):\s*(\d{1,2})/(\d{1,2})\s*$",
+        re.IGNORECASE,
+    )
+    # 3) Matcher "Mandag d.4/4" osv. (ugedags‐header)
+    pattern_weekday = re.compile(r"\b\w+\.?\s*d\.?\s*(\d{1,2})/(\d{1,2})", re.IGNORECASE)
+    # 4) Matcher en vagtlinje "13.30-19: Navn"
     pattern_shift = re.compile(
         r"(\d{1,2}(?:[:\.]\d{2})?)[\s\-–]+(\d{1,2}(?:[:\.]\d{2})?|luk|\?\?)\s*(?::\s*|\s{2,})(.+)",
         re.IGNORECASE,
     )
 
     events = []
+    all_names = set()
+
     current_date = None
     custom_location = None
-    in_moments = False
-    norm_targets = [normalize_name(t) for t in target_names]
+    default_location = "D'Wine Bar, Algade 54, 9000 Aalborg"
+
+    # Først: find alle navne i planen (til dropdown)
+    name_pattern = re.compile(
+        r"(\d{1,2}(?:[:\.]\d{2})?)[\s\-–]+(\d{1,2}(?:[:\.]\d{2})?|luk|\?\?)\s*(?::\s*|\s{2,})(.+)",
+        re.IGNORECASE,
+    )
+    for line in text.splitlines():
+        m = name_pattern.match(line.strip())
+        if not m:
+            continue
+        _, _, names_line = m.groups()
+        for nm in re.split(r",| og ", names_line):
+            cleaned = normalize_name(nm)
+            if cleaned:
+                all_names.add(cleaned)
+
+    # Gem liste over alle normaliserede navne
+    norm_all_names = list(all_names)
 
     for line in text.splitlines():
         raw = line.strip()
         if not raw:
-            in_moments = False
             continue
 
-        # Fri tekst “Navn: DD/MM”
-        dm2 = pattern_date2.match(raw)
-        if dm2:
-            prefix, d, m = dm2.groups()
+        # 1) "Prefix – Person: DD/MM"
+        m_ext = pattern_date_ext.match(raw)
+        if m_ext:
+            prefix_loc, d, m = m_ext.groups()
             current_date = f"{int(d):02d}/{int(m):02d}/{year}"
-            custom_location = prefix.strip()
-            in_moments = "moments" in prefix.lower()
+            if prefix_loc.strip().lower() == "moments":
+                custom_location = "Moments"
+            else:
+                custom_location = prefix_loc.strip()
             continue
 
-        # Ugedag header “Mandag d.DD/MM”
-        dm1 = pattern_date1.search(raw)
-        if dm1:
-            d, m = dm1.groups()
+        # 2) "Prefix: DD/MM"
+        m_simp = pattern_date_simple.match(raw)
+        if m_simp:
+            prefix, d, m = m_simp.groups()
             current_date = f"{int(d):02d}/{int(m):02d}/{year}"
+            pref_low = prefix.strip().lower()
+
+            if pref_low == "moments":
+                custom_location = "Moments"
+            elif pref_low == "albert rex":
+                custom_location = "Albert Rex"
+            else:
+                # To-ords præfiks antages som personnavn → Moments
+                if len(prefix.split()) >= 2:
+                    custom_location = "Moments"
+                else:
+                    custom_location = None
+            continue
+
+        # 3) Ugedags‐header "Mandag d.4/4"
+        w = pattern_weekday.search(raw)
+        if w:
+            d, m = w.groups()
+            current_date = f"{int(d):02d}/{int(m):02d}/{year}"
+            # Ingen præfiks‐lokation → default
             custom_location = None
-            in_moments = False
             continue
 
+        # 4) Vagtlinje (kun hvis current_date er sat)
         if current_date is None:
             continue
 
@@ -139,47 +201,73 @@ def extract_shifts(text, target_names, year, closing_hours):
 
         try:
             dt_start = datetime.strptime(f"{current_date} {start_ts}", "%d/%m/%Y %H:%M")
-            dt_end   = datetime.strptime(f"{current_date} {end_ts}",   "%d/%m/%Y %H:%M")
+            dt_end = datetime.strptime(f"{current_date} {end_ts}", "%d/%m/%Y %H:%M")
             if dt_end <= dt_start:
                 dt_end += timedelta(days=1)
         except Exception:
             continue
 
-        raw_desc = "Moments" if in_moments else "Bar"
-
         for nm in re.split(r",| og ", names_line):
-            note_match = re.search(r"\(\s*(rengør|rengøring|støvsug|opvask|vask|clean|note)\s*\)", nm, re.IGNORECASE)
-            note = note_match.group(1).lower() if note_match else None
-
             cleaned = normalize_name(nm)
-            if cleaned in norm_targets:
-                if custom_location:
-                    location = custom_location
-                else:
-                    place = "Moments" if in_moments else "Bar"
-                    location = f"D'Wine {place}, Algade 54, 9000 Aalborg"
+            if cleaned not in norm_all_names:
+                continue
 
-                full_desc = raw_desc + (f" – {note}" if note else "")
-                events.append({
-                    "name": cleaned,
-                    "start": dt_start,
-                    "end": dt_end,
-                    "raw": full_desc,
-                    "location": location
-                })
+            # Parentetisk note i beskrivelsen
+            note_match = re.search(
+                r"\(\s*(rengør|rengøring|støvsug|opvask|vask|clean|note)\s*\)", nm, re.IGNORECASE
+            )
+            description = note_match.group(1).lower() if note_match else ""
+
+            # Bestem lokation: custom_location hvis sat, ellers default
+            location = custom_location if custom_location else default_location
+
+            events.append({
+                "name": cleaned,
+                "start": dt_start,
+                "end": dt_end,
+                "raw": description,
+                "location": location,
+            })
 
     return events
 
-def create_ics(events, custom_title):
-    """Opret en .ics-fil i hukommelsen baseret på events."""
+def create_ics(events, custom_title, selected_name):
+    """Opret en .ics-fil i hukommelsen baseret på events, med info om hvem der ellers er på arbejde."""
+    from collections import defaultdict
+
     cal = Calendar()
+
+    # Filtrer kun de events, der tilhører selected_name
+    your_events = [e for e in events if e["name"] == selected_name]
+
+    # Grupér alle events per dato
+    events_by_date = defaultdict(list)
     for e in events:
+        date_key = e["start"].date()
+        events_by_date[date_key].append(e)
+
+    for e in your_events:
         ev = Event()
         ev.name = custom_title
         ev.begin = e["start"]
         ev.end = e["end"]
-        ev.description = e["raw"]
         ev.location = e["location"]
+
+        # Find andre på arbejde samme dag (inkluderer også vagter for samme person, men med forskellig tid)
+        same_day = events_by_date[e["start"].date()]
+        others = [
+            f"- {other['name'].title()}: {other['start'].strftime('%H:%M')} – {other['end'].strftime('%H:%M')}"
+            for other in same_day if other["name"] != e["name"]
+        ]
+
+        # Byg beskrivelsen (note-feltet i kalenderen)
+        note_text = f"Din vagt: {e['start'].strftime('%H:%M')} – {e['end'].strftime('%H:%M')}"
+        if e["raw"]:
+            note_text += f"\nNote: {e['raw']}"
+        if others:
+            note_text += "\n\nAndre på vagt:\n" + "\n".join(others)
+
+        ev.description = note_text
         cal.events.add(ev)
 
     output = BytesIO()
@@ -231,20 +319,21 @@ if uploaded_file:
     # Når brugeren har valgt/indtastet navn
     if selected_name:
         with st.spinner("Finder vagter for dig…"):
-            shifts = extract_shifts(
+            # Ekstrakt alle vagter
+            all_shifts = extract_shifts(
                 raw_text,
-                [selected_name],
                 ÅR,
                 closing_hours=[22, 22, 23, 23, 2, 2, 22],  # Man→Søn
             )
+            # Filtrer for den valgte bruger inde i create_ics
+            ics_file = create_ics(all_shifts, custom_title, selected_name)
 
-        if not shifts:
+        # Hvis ingen vagter for selected_name
+        user_shifts = [e for e in all_shifts if e["name"] == selected_name]
+        if not user_shifts:
             st.warning("🕵️‍♂️ Ingen vagter fundet for det valgte navn. Tjek du har stavet korrekt eller prøv et andet navn.")
         else:
-            st.success(f"✅ Fandt {len(shifts)} vagt(er) for '{selected_display if all_names_norm else typed.title()}'.")
-            ics_file = create_ics(shifts, custom_title)
-
-            # Download-knap
+            st.success(f"✅ Fandt {len(user_shifts)} vagt(er) for '{selected_display if all_names_norm else typed.title()}'.")
             st.download_button(
                 label="📥 Download din .ics-fil",
                 data=ics_file,
