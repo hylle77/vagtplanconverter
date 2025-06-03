@@ -341,9 +341,6 @@ if uploaded_file:
                 mime="text/calendar",
             )
 
-            # Balloner
-            st.balloons()
-
             # Ekstra info
             st.markdown(
                 """
